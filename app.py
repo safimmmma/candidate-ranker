@@ -483,18 +483,19 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.sidebar.markdown("### Gemini settings")
-api_key_input = st.sidebar.text_input(
-    "Gemini API key",
-    type="password",
-    value="",
-    help="Use a key from a different Google project/account if you need a fresh quota.",
-)
-model_input = st.sidebar.text_input(
-    "Gemini model",
-    value=os.environ.get("GEMINI_MODEL_NAME", DEFAULT_MODEL_NAME),
-    help="Examples: gemini-3.8-flash, gemini-1.5-flash",
-)
+# Expose API key and model inputs in the main UI (sidebar is hidden by app CSS)
+with st.expander("Gemini settings (override)", expanded=True):
+    api_key_input = st.text_input(
+        "Gemini API key",
+        type="password",
+        value="",
+        help="Use a key from a different Google project/account if you need a fresh quota.",
+    )
+    model_input = st.text_input(
+        "Gemini model",
+        value=os.environ.get("GEMINI_MODEL_NAME", DEFAULT_MODEL_NAME),
+        help="Examples: gemini-3.8-flash, gemini-1.5-flash",
+    )
 
 left, right = st.columns((1.35, 1), gap="large")
 with left:
@@ -627,7 +628,7 @@ if rank_clicked:
         )
         if top_candidate:
             strengths = as_items(top_candidate.get("Key_Strengths"))
-            rationale = " ".join(strengths[:2])
+            rationale = " \".join(strengths[:2])
             recommendation_text = f"{top_candidate['Name']} ({top_candidate['Match_Score']}%). {rationale}"
         else:
             recommendation_text = "No candidate could be recommended because no CV was successfully analyzed."
