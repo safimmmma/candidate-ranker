@@ -4,8 +4,8 @@ import os
 import re
 import threading
 import time
-from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
@@ -14,14 +14,10 @@ from google.genai import types
 from pypdf import PdfReader
 
 MODEL_NAME = os.environ.get("GEMINI_MODEL_NAME", "gemini-3.8-flash")
-MODEL_FALLBACKS = (
-    MODEL_NAME,
-    "gemini-3.8-flash",
-    "gemini-1.5-flash",
-)
+MODEL_FALLBACKS = tuple(dict.fromkeys((MODEL_NAME, "gemini-3.8-flash", "gemini-1.5-flash")))
 MAX_CV_CHARS = 12_000
 BATCH_SIZE = 8
-MAX_WORKERS = 8
+MAX_WORKERS = 5
 MAX_RETRIES = 3
 MIN_API_REQUEST_INTERVAL = 3.0
 RETRYABLE_MARKERS = (
@@ -200,12 +196,30 @@ def is_retryable(exc: Exception) -> bool:
     return any(marker in text for marker in RETRYABLE_MARKERS)
 
 
-def retry_after_seconds(exc: Exception) -> float:
+def extract_retry_delay_seconds(exc: Exception) -> float:
     text = str(exc)
-    match = re.search(r"retryDelay['\"]?\s*:\s*['\"]([\d.]+)s['\"]", text, re.IGNORECASE)
-    if match is None:
-        match = re.search(r"retry in\s+([\d.]+)s", text, re.IGNORECASE)
-    return float(match.group(1)) if match else 0.0
+    patterns = [
+        r"retryDelay['\"]?\s*:\s*['\"]?([\d.]+)s['\"]?",
+        r"retry in\s+(\d+)h\s*(\d+)m\s*([\d.]+)s",
+        r"retry in\s+(\d+)m\s*([\d.]+)s",
+        r"retry in\s+([\d.]+)s",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if not match:
+            continue
+        if len(match.groups()) == 3:
+            hours, minutes, seconds = match.groups()
+            return float(hours) * 3600 + float(minutes) * 60 + float(seconds)
+        if len(match.groups()) == 2:
+            minutes, seconds = match.groups()
+            return float(minutes) * 60 + float(seconds)
+        return float(match.group(1))
+    return 0.0
+
+
+def retry_after_seconds(exc: Exception) -> float:
+    return extract_retry_delay_seconds(exc)
 
 
 def wait_for_api_slot() -> None:
@@ -322,13 +336,22 @@ def generate_json(
             except Exception as exc:
                 last_error = exc
                 error_text = str(exc).upper()
-                if "NOT_FOUND" in error_text or "is not found" in error_text:
+                if "NOT_FOUND" in error_text or "IS NOT FOUND" in error_text:
                     continue
                 if not is_retryable(exc) or attempt == MAX_RETRIES:
                     raise
-        time.sleep(max(delay, retry_after_seconds(last_error or Exception("retry"))))
+        retry_delay = extract_retry_delay_seconds(last_error or Exception("retry"))
+        time.sleep(max(delay, retry_delay))
         delay = min(delay * 2, 4)
     raise last_error
+
+
+@st.cache_data(show_spinner=False)
+def analyze_candidate_cv(job_description: str, filename: str, cv_text: str) -> dict:
+    client = genai.Client(api_key=get_api_key())
+    prompt = build_candidate_prompt(job_description, [{"filename": filename, "text": cv_text}])
+    parsed_rows = generate_json(client, prompt, expected_count=1)
+    return parsed_rows[0]
 
 
 def rank_candidates(
@@ -343,21 +366,28 @@ def rank_candidates(
     batches = list(batched(candidates, batch_size))
     leaderboard = []
     finished = 0
-    workers = min(MAX_WORKERS, len(batches))
+    workers = min(MAX_WORKERS, max(1, len(batches)))
+    progress_lock = threading.Lock()
 
     if status is not None:
         status.info(f"Ranking {total} CVs...")
     if progress is not None:
-        progress.progress(0, text="Starting ranking...")
+        progress.progress(0.0, text="Starting ranking...")
 
     shared_client = genai.Client(api_key=api_key)
 
     def run_batch(batch: list[dict]) -> list[dict]:
-        parsed_rows = generate_json(
-            shared_client,
-            build_candidate_prompt(job_description, batch),
-            expected_count=len(batch),
-        )
+        if len(batch) == 1:
+            candidate = batch[0]
+            parsed = analyze_candidate_cv(job_description, candidate["filename"], candidate["text"])
+            parsed_rows = [parsed]
+        else:
+            parsed_rows = generate_json(
+                shared_client,
+                build_candidate_prompt(job_description, batch),
+                expected_count=len(batch),
+            )
+
         results = []
         for candidate, parsed in zip(batch, parsed_rows):
             score = max(0, min(100, int(parsed.get("Match_Score", 0))))
@@ -376,15 +406,14 @@ def rank_candidates(
 
     def record_result(row: dict) -> None:
         nonlocal finished
-        leaderboard.append(row)
-        finished += 1
+        with progress_lock:
+            leaderboard.append(row)
+            finished += 1
+            current = finished
         if progress is not None:
-            progress.progress(
-                finished / total,
-                text=f"Processed {finished} of {total} CVs",
-            )
+            progress.progress(min(current / total, 1.0), text=f"Processed {current} of {total} CVs")
         if status is not None:
-            status.info(f"Processed {finished} of {total} CVs")
+            status.info(f"Processed {current} of {total} CVs")
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {pool.submit(run_batch, batch): batch for batch in batches}
@@ -556,11 +585,18 @@ if rank_clicked:
             except Exception as exc:
                 progress.empty()
                 status.empty()
+                retry_delay = extract_retry_delay_seconds(exc)
+                if retry_delay > 0:
+                    st.error(
+                        "Gemini API quota has been exhausted. Please wait "
+                        f"{int(retry_delay // 60)} minutes before trying again. Details: {exc}"
+                    )
+                else:
+                    st.error(
+                        "Ranking failed after retries. Gemini was overloaded or unreachable. "
+                        f"Wait a minute and try again. Details: {exc}"
+                    )
                 results = parse_errors
-                st.error(
-                    "Ranking failed after retries. Gemini was overloaded or unreachable. "
-                    f"Wait a minute and try again. Details: {exc}"
-                )
 
         results.sort(key=lambda row: row["Match_Score"], reverse=True)
         top_candidate = next(
