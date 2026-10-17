@@ -15,7 +15,7 @@ from pypdf import PdfReader
 
 MODEL_NAME = "gemini-3.8-flash"
 MAX_CV_CHARS = 12_000
-BATCH_SIZE = 8
+BATCH_SIZE = 5
 MAX_WORKERS = 5
 MAX_RETRIES = 3
 MIN_API_REQUEST_INTERVAL = 12.2
@@ -236,20 +236,27 @@ def items_html(items: list[str], empty: str) -> str:
     return f"<ul>{lis}</ul>"
 
 
-def build_candidate_prompt(job_description: str, candidate: dict) -> str:
-        return f"""You are an expert technical recruiter and hiring manager.
+def build_candidate_prompt(job_description: str, candidates: list[dict]) -> str:
+    candidate_blocks = []
+    for index, candidate in enumerate(candidates, start=1):
+        candidate_blocks.append(
+            f"--- CANDIDATE {index} ---\n"
+            f"Source file: {candidate['filename']}\n"
+            f"CV text:\n{candidate['text']}"
+        )
+    cv_bundle = "\n\n".join(candidate_blocks)
+    return f"""You are an expert technical recruiter and hiring manager.
 
-Evaluate this candidate against the job description. Use a consistent score:
+Evaluate each candidate against the job description. Use a consistent score:
 90-100 exceptional fit, 75-89 strong fit, 60-74 partial fit, below 60 weak fit.
 
 JOB DESCRIPTION:
 {job_description[:3500]}
 
-CANDIDATE SOURCE FILE: {candidate['filename']}
-CANDIDATE CV:
-{candidate['text']}
+ CANDIDATE CVS, IN ORDER:
+{cv_bundle}
 
-Respond strictly with valid JSON and no markdown, prose, or code fences. Return an array containing exactly one object with exactly these keys:
+Respond strictly with valid JSON and no markdown, prose, or code fences. Return a JSON array with exactly one object per candidate, in the same order as the CVs above. Each object must have exactly these keys:
 [
     {{
         "Name": "Candidate full name, or a clean version of the source filename if not stated",
@@ -265,11 +272,16 @@ Rules:
 - Key_Strengths and Missing_Requirements must be arrays of concise strings.
 - Set Top_Recommendation_Status to "Recommended" only when the candidate is an exceptional fit; otherwise use "Not Recommended". The app will determine the final top-ranked candidate across all CVs.
 - Be specific and do not invent experience or qualifications.
-- Return the candidate exactly once.
+- Include every candidate exactly once and preserve their order.
 """
 
 
-def generate_json(client, prompt: str, before_request=wait_for_api_slot) -> list:
+def generate_json(
+    client,
+    prompt: str,
+    expected_count: int,
+    before_request=wait_for_api_slot,
+) -> list:
     last_error = None
     delay = 0.8
     for attempt in range(1, MAX_RETRIES + 1):
@@ -285,8 +297,14 @@ def generate_json(client, prompt: str, before_request=wait_for_api_slot) -> list
                 ),
             )
             data = json.loads(response.text)
-            if not isinstance(data, list) or len(data) != 1 or not isinstance(data[0], dict):
-                raise ValueError("Gemini returned JSON that did not contain exactly one candidate object.")
+            if (
+                not isinstance(data, list)
+                or len(data) != expected_count
+                or any(not isinstance(row, dict) for row in data)
+            ):
+                raise ValueError(
+                    f"Gemini returned JSON that did not contain exactly {expected_count} candidate objects."
+                )
             return data
         except Exception as exc:
             last_error = exc
@@ -305,55 +323,71 @@ def rank_candidates(
     status=None,
 ) -> list[dict]:
     total = len(candidates)
+    batches = list(batched(candidates, BATCH_SIZE))
     leaderboard = []
     finished = 0
-    workers = min(MAX_WORKERS, max(total, 1))
+    workers = min(MAX_WORKERS, len(batches))
 
     if status is not None:
         status.info(f"Ranking {total} CVs...")
     if progress is not None:
         progress.progress(0, text="Starting ranking...")
 
-    def run_candidate(candidate: dict) -> dict:
+    def run_batch(batch: list[dict]) -> list[dict]:
         client = genai.Client(api_key=api_key)
-        parsed = generate_json(client, build_candidate_prompt(job_description, candidate))[0]
-        score = max(0, min(100, int(parsed.get("Match_Score", 0))))
-        return {
-            "Name": str(parsed.get("Name") or os.path.splitext(candidate["filename"])[0]),
-            "Match_Score": score,
-            "Key_Strengths": as_items(parsed.get("Key_Strengths")),
-            "Missing_Requirements": as_items(parsed.get("Missing_Requirements")),
-            "Top_Recommendation_Status": str(
-                parsed.get("Top_Recommendation_Status") or "Not Recommended"
-            ),
-        }
+        parsed_rows = generate_json(
+            client,
+            build_candidate_prompt(job_description, batch),
+            expected_count=len(batch),
+        )
+        results = []
+        for candidate, parsed in zip(batch, parsed_rows):
+            score = max(0, min(100, int(parsed.get("Match_Score", 0))))
+            results.append(
+                {
+                    "Name": str(parsed.get("Name") or os.path.splitext(candidate["filename"])[0]),
+                    "Match_Score": score,
+                    "Key_Strengths": as_items(parsed.get("Key_Strengths")),
+                    "Missing_Requirements": as_items(parsed.get("Missing_Requirements")),
+                    "Top_Recommendation_Status": str(
+                        parsed.get("Top_Recommendation_Status") or "Not Recommended"
+                    ),
+                }
+            )
+        return results
+
+    def record_result(row: dict) -> None:
+        nonlocal finished
+        leaderboard.append(row)
+        finished += 1
+        if progress is not None:
+            progress.progress(
+                finished / total,
+                text=f"Processed {finished} of {total} CVs",
+            )
+        if status is not None:
+            status.info(f"Processed {finished} of {total} CVs")
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(run_candidate, candidate): candidate for candidate in candidates}
+        futures = {pool.submit(run_batch, batch): batch for batch in batches}
         for future in as_completed(futures):
-            candidate = futures[future]
-            finished += 1
+            batch = futures[future]
             try:
-                leaderboard.append(future.result())
+                for row in future.result():
+                    record_result(row)
             except Exception as exc:
-                candidate_name = os.path.splitext(candidate["filename"])[0]
-                st.warning(f"{candidate_name}: Failed to Analyze ({exc})")
-                leaderboard.append(
-                    {
-                        "Name": candidate_name,
-                        "Match_Score": 0,
-                        "Key_Strengths": [],
-                        "Missing_Requirements": ["Failed to Analyze"],
-                        "Top_Recommendation_Status": "Failed to Analyze",
-                    }
-                )
-            if progress is not None:
-                progress.progress(
-                    finished / total,
-                    text=f"Processed {finished} of {total} CVs",
-                )
-            if status is not None:
-                status.info(f"Processed {finished} of {total} CVs")
+                for candidate in batch:
+                    candidate_name = os.path.splitext(candidate["filename"])[0]
+                    st.warning(f"{candidate_name}: Failed to Analyze ({exc})")
+                    record_result(
+                        {
+                            "Name": candidate_name,
+                            "Match_Score": 0,
+                            "Key_Strengths": [],
+                            "Missing_Requirements": ["Failed to Analyze"],
+                            "Top_Recommendation_Status": "Failed to Analyze",
+                        }
+                    )
 
     leaderboard.sort(key=lambda row: row["Match_Score"], reverse=True)
     if not leaderboard:
