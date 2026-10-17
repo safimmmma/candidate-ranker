@@ -15,10 +15,10 @@ from pypdf import PdfReader
 
 MODEL_NAME = "gemini-3.8-flash"
 MAX_CV_CHARS = 12_000
-BATCH_SIZE = 5
-MAX_WORKERS = 5
+BATCH_SIZE = 8
+MAX_WORKERS = 8
 MAX_RETRIES = 3
-MIN_API_REQUEST_INTERVAL = 12.2
+MIN_API_REQUEST_INTERVAL = 3.0
 RETRYABLE_MARKERS = (
     "503",
     "429",
@@ -30,6 +30,7 @@ RETRYABLE_MARKERS = (
 )
 _API_REQUEST_LOCK = threading.Lock()
 _NEXT_API_REQUEST_AT = 0.0
+
 
 def load_local_env() -> None:
     env_file = Path(__file__).with_name(".env")
@@ -256,7 +257,7 @@ JOB DESCRIPTION:
  CANDIDATE CVS, IN ORDER:
 {cv_bundle}
 
-Respond strictly with valid JSON and no markdown, prose, or code fences. Return a JSON array with exactly one object per candidate, in the same order as the CVs above. Each object must have exactly these keys:
+Respond strictly with valid JSON and no markdown, prose, or code fences. Return a JSON array with exactly one object per candidate, in the same order as the CVs above. Each object must have exactly the following shape:
 [
     {{
         "Name": "Candidate full name, or a clean version of the source filename if not stated",
@@ -323,7 +324,8 @@ def rank_candidates(
     status=None,
 ) -> list[dict]:
     total = len(candidates)
-    batches = list(batched(candidates, BATCH_SIZE))
+    batch_size = min(BATCH_SIZE, max(1, total))
+    batches = list(batched(candidates, batch_size))
     leaderboard = []
     finished = 0
     workers = min(MAX_WORKERS, len(batches))
@@ -333,10 +335,11 @@ def rank_candidates(
     if progress is not None:
         progress.progress(0, text="Starting ranking...")
 
+    shared_client = genai.Client(api_key=api_key)
+
     def run_batch(batch: list[dict]) -> list[dict]:
-        client = genai.Client(api_key=api_key)
         parsed_rows = generate_json(
-            client,
+            shared_client,
             build_candidate_prompt(job_description, batch),
             expected_count=len(batch),
         )
@@ -483,28 +486,42 @@ if rank_clicked:
         st.session_state.pop("ranking_results", None)
         st.session_state.pop("ranking_dataframe", None)
         st.session_state.pop("top_recommendation", None)
+
         candidates = []
         parse_errors = []
         text_limit = cv_char_limit(len(uploaded_files))
-        for uploaded in uploaded_files:
+
+        def _extract_file(uploaded_file):
             try:
-                candidates.append(
-                    {
-                        "filename": uploaded.name,
-                        "text": extract_text(uploaded, text_limit),
-                    }
-                )
+                return {
+                    "ok": True,
+                    "result": {
+                        "filename": uploaded_file.name,
+                        "text": extract_text(uploaded_file, text_limit),
+                    },
+                }
             except Exception as exc:
-                candidate_name = os.path.splitext(uploaded.name)[0]
-                parse_errors.append(
-                    {
+                candidate_name = os.path.splitext(uploaded_file.name)[0]
+                return {
+                    "ok": False,
+                    "error": {
                         "Name": candidate_name,
                         "Match_Score": 0,
                         "Key_Strengths": [],
                         "Missing_Requirements": [f"Failed to Analyze: {exc}"],
                         "Top_Recommendation_Status": "Failed to Analyze",
-                    }
-                )
+                    },
+                }
+
+        extraction_workers = min(8, max(1, len(uploaded_files)))
+        with ThreadPoolExecutor(max_workers=extraction_workers) as pool:
+            futures = [pool.submit(_extract_file, uploaded_file) for uploaded_file in uploaded_files]
+            for future in as_completed(futures):
+                result = future.result()
+                if result["ok"]:
+                    candidates.append(result["result"])
+                else:
+                    parse_errors.append(result["error"])
 
         if not candidates:
             results = parse_errors
@@ -572,3 +589,4 @@ if "ranking_results" in st.session_state:
         file_name="candidate_leaderboard.csv",
         mime="text/csv",
     )
+
