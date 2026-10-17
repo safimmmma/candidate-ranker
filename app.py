@@ -13,8 +13,8 @@ from google import genai
 from google.genai import types
 from pypdf import PdfReader
 
-MODEL_NAME = os.environ.get("GEMINI_MODEL_NAME", "gemini-3.8-flash")
-MODEL_FALLBACKS = tuple(dict.fromkeys((MODEL_NAME, "gemini-3.8-flash", "gemini-1.5-flash")))
+DEFAULT_MODEL_NAME = os.environ.get("GEMINI_MODEL_NAME", "gemini-3.8-flash")
+MODEL_FALLBACKS = tuple(dict.fromkeys((DEFAULT_MODEL_NAME, "gemini-3.8-flash", "gemini-1.5-flash")))
 MAX_CV_CHARS = 12_000
 BATCH_SIZE = 8
 MAX_WORKERS = 5
@@ -301,21 +301,26 @@ Rules:
 """
 
 
+def get_model_names(model_name: str | None) -> list[str]:
+    candidates = [model_name or DEFAULT_MODEL_NAME, DEFAULT_MODEL_NAME, "gemini-3.8-flash", "gemini-1.5-flash"]
+    return list(dict.fromkeys(item.strip() for item in candidates if item and item.strip()))
+
+
 def generate_json(
     client,
     prompt: str,
     expected_count: int,
+    model_name: str | None = None,
     before_request=wait_for_api_slot,
 ) -> list:
     last_error = None
     delay = 0.8
-    model_names = tuple(dict.fromkeys(MODEL_FALLBACKS))
     for attempt in range(1, MAX_RETRIES + 1):
-        for model_name in model_names:
+        for candidate_model in get_model_names(model_name):
             try:
                 before_request()
                 response = client.models.generate_content(
-                    model=model_name,
+                    model=candidate_model,
                     contents=prompt,
                     config=types.GenerateContentConfig(
                         temperature=0.1,
@@ -347,10 +352,10 @@ def generate_json(
 
 
 @st.cache_data(show_spinner=False)
-def analyze_candidate_cv(job_description: str, filename: str, cv_text: str) -> dict:
-    client = genai.Client(api_key=get_api_key())
+def analyze_candidate_cv(job_description: str, filename: str, cv_text: str, api_key: str, model_name: str) -> dict:
+    client = genai.Client(api_key=api_key)
     prompt = build_candidate_prompt(job_description, [{"filename": filename, "text": cv_text}])
-    parsed_rows = generate_json(client, prompt, expected_count=1)
+    parsed_rows = generate_json(client, prompt, expected_count=1, model_name=model_name)
     return parsed_rows[0]
 
 
@@ -360,6 +365,7 @@ def rank_candidates(
     candidates: list[dict],
     progress=None,
     status=None,
+    model_name: str | None = None,
 ) -> list[dict]:
     total = len(candidates)
     batch_size = min(BATCH_SIZE, max(1, total))
@@ -379,13 +385,14 @@ def rank_candidates(
     def run_batch(batch: list[dict]) -> list[dict]:
         if len(batch) == 1:
             candidate = batch[0]
-            parsed = analyze_candidate_cv(job_description, candidate["filename"], candidate["text"])
+            parsed = analyze_candidate_cv(job_description, candidate["filename"], candidate["text"], api_key, model_name or DEFAULT_MODEL_NAME)
             parsed_rows = [parsed]
         else:
             parsed_rows = generate_json(
                 shared_client,
                 build_candidate_prompt(job_description, batch),
                 expected_count=len(batch),
+                model_name=model_name,
             )
 
         results = []
@@ -476,6 +483,19 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+st.sidebar.markdown("### Gemini settings")
+api_key_input = st.sidebar.text_input(
+    "Gemini API key",
+    type="password",
+    value="",
+    help="Use a key from a different Google project/account if you need a fresh quota.",
+)
+model_input = st.sidebar.text_input(
+    "Gemini model",
+    value=os.environ.get("GEMINI_MODEL_NAME", DEFAULT_MODEL_NAME),
+    help="Examples: gemini-3.8-flash, gemini-1.5-flash",
+)
+
 left, right = st.columns((1.35, 1), gap="large")
 with left:
     st.markdown('<div class="section-label">Job description</div>', unsafe_allow_html=True)
@@ -514,10 +534,11 @@ with right:
 rank_clicked = st.button("Rank Candidates", type="primary", use_container_width=True)
 
 if rank_clicked:
-    api_key = get_api_key()
+    api_key = api_key_input.strip() or get_api_key()
+    model_name = model_input.strip() or DEFAULT_MODEL_NAME
     errors = []
     if not api_key:
-        errors.append("No Gemini API key found in .streamlit/secrets.toml.")
+        errors.append("No Gemini API key found in .streamlit/secrets.toml or the form above.")
     if not job_description.strip():
         errors.append("Paste a job description first.")
     if not uploaded_files:
@@ -580,6 +601,7 @@ if rank_clicked:
                     candidates,
                     progress=progress,
                     status=status,
+                    model_name=model_name,
                 )
                 results = result + parse_errors
             except Exception as exc:
