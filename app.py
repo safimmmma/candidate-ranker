@@ -2,6 +2,7 @@ import html
 import json
 import os
 import re
+import threading
 import time
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -17,6 +18,7 @@ MAX_CV_CHARS = 12_000
 BATCH_SIZE = 8
 MAX_WORKERS = 5
 MAX_RETRIES = 3
+MIN_API_REQUEST_INTERVAL = 12.2
 RETRYABLE_MARKERS = (
     "503",
     "429",
@@ -26,6 +28,8 @@ RETRYABLE_MARKERS = (
     "TRY AGAIN",
     "OVERLOADED",
 )
+_API_REQUEST_LOCK = threading.Lock()
+_NEXT_API_REQUEST_AT = 0.0
 
 def load_local_env() -> None:
     env_file = Path(__file__).with_name(".env")
@@ -185,6 +189,25 @@ def is_retryable(exc: Exception) -> bool:
     return any(marker in text for marker in RETRYABLE_MARKERS)
 
 
+def retry_after_seconds(exc: Exception) -> float:
+    text = str(exc)
+    match = re.search(r"retryDelay['\"]?\s*:\s*['\"]([\d.]+)s['\"]", text, re.IGNORECASE)
+    if match is None:
+        match = re.search(r"retry in\s+([\d.]+)s", text, re.IGNORECASE)
+    return float(match.group(1)) if match else 0.0
+
+
+def wait_for_api_slot() -> None:
+    global _NEXT_API_REQUEST_AT
+    with _API_REQUEST_LOCK:
+        now = time.monotonic()
+        request_at = max(now, _NEXT_API_REQUEST_AT)
+        _NEXT_API_REQUEST_AT = request_at + MIN_API_REQUEST_INTERVAL
+        delay = request_at - now
+    if delay > 0:
+        time.sleep(delay)
+
+
 def as_items(value) -> list[str]:
     if isinstance(value, list):
         return [str(item).strip() for item in value if str(item).strip()]
@@ -246,11 +269,12 @@ Rules:
 """
 
 
-def generate_json(client, prompt: str) -> list:
+def generate_json(client, prompt: str, before_request=wait_for_api_slot) -> list:
     last_error = None
     delay = 0.8
     for attempt in range(1, MAX_RETRIES + 1):
         try:
+            before_request()
             response = client.models.generate_content(
                 model=MODEL_NAME,
                 contents=prompt,
@@ -268,7 +292,7 @@ def generate_json(client, prompt: str) -> list:
             last_error = exc
             if not is_retryable(exc) or attempt == MAX_RETRIES:
                 raise
-            time.sleep(delay)
+            time.sleep(max(delay, retry_after_seconds(exc)))
             delay = min(delay * 2, 4)
     raise last_error
 
