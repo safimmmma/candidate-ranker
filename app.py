@@ -3,8 +3,10 @@ import json
 import os
 import re
 import time
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import pandas as pd
 import streamlit as st
 from google import genai
 from google.genai import types
@@ -24,6 +26,25 @@ RETRYABLE_MARKERS = (
     "TRY AGAIN",
     "OVERLOADED",
 )
+
+def load_local_env() -> None:
+    env_file = Path(__file__).with_name(".env")
+    if not env_file.is_file():
+        return
+    for line in env_file.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        name, value = line.split("=", 1)
+        name = name.strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        if name:
+            os.environ.setdefault(name, value)
+
+
+load_local_env()
 
 st.set_page_config(
     page_title="Candidate Ranker",
@@ -192,50 +213,40 @@ def items_html(items: list[str], empty: str) -> str:
     return f"<ul>{lis}</ul>"
 
 
-def build_batch_prompt(job_description: str, candidates: list[dict]) -> str:
-    blocks = []
-    for index, candidate in enumerate(candidates, start=1):
-        blocks.append(
-            f"--- CANDIDATE {index} ---\n"
-            f"Source file: {candidate['filename']}\n"
-            f"CV text:\n{candidate['text']}\n"
-        )
-    cv_bundle = "\n".join(blocks)
-    return f"""You are an expert technical recruiter and hiring manager.
+def build_candidate_prompt(job_description: str, candidate: dict) -> str:
+        return f"""You are an expert technical recruiter and hiring manager.
 
-Score each candidate against the Job Description independently, using the same scale every time:
+Evaluate this candidate against the job description. Use a consistent score:
 90-100 exceptional fit, 75-89 strong fit, 60-74 partial fit, below 60 weak fit.
 
 JOB DESCRIPTION:
 {job_description[:3500]}
 
-CANDIDATE CVs:
-{cv_bundle}
+CANDIDATE SOURCE FILE: {candidate['filename']}
+CANDIDATE CV:
+{candidate['text']}
 
-Return JSON only:
-{{
-  "leaderboard": [
+Respond strictly with valid JSON and no markdown, prose, or code fences. Return an array containing exactly one object with exactly these keys:
+[
     {{
-      "name": "Candidate full name (infer from the CV; if missing, use a clean version of the filename)",
-      "source_file": "exact source filename",
-      "match_score": 0,
-      "key_strengths": ["Concrete strength with evidence from the CV"],
-      "weaknesses": ["Concrete gap, missing requirement, or risk versus the job description"]
+        "Name": "Candidate full name, or a clean version of the source filename if not stated",
+        "Match_Score": 0,
+        "Key_Strengths": ["Concrete strength supported by CV evidence"],
+        "Missing_Requirements": ["Concrete job requirement that is missing or not evidenced"],
+        "Top_Recommendation_Status": "Not Recommended"
     }}
-  ]
-}}
+]
 
 Rules:
-- Include every candidate in this batch exactly once.
-- match_score is an integer from 0 to 100.
-- key_strengths and weaknesses must each contain exactly 3 short but complete phrases.
-- Weaknesses should cover missing requirements and role risks.
-- Be specific. Do not invent job history that is not in the CV.
-- Keep the JSON compact.
+- Match_Score must be an integer from 0 to 100.
+- Key_Strengths and Missing_Requirements must be arrays of concise strings.
+- Set Top_Recommendation_Status to "Recommended" only when the candidate is an exceptional fit; otherwise use "Not Recommended". The app will determine the final top-ranked candidate across all CVs.
+- Be specific and do not invent experience or qualifications.
+- Return the candidate exactly once.
 """
 
 
-def generate_json(client, prompt: str) -> dict:
+def generate_json(client, prompt: str) -> list:
     last_error = None
     delay = 0.8
     for attempt in range(1, MAX_RETRIES + 1):
@@ -250,8 +261,8 @@ def generate_json(client, prompt: str) -> dict:
                 ),
             )
             data = json.loads(response.text)
-            if not isinstance(data, dict):
-                raise ValueError("Gemini returned JSON that was not an object.")
+            if not isinstance(data, list) or len(data) != 1 or not isinstance(data[0], dict):
+                raise ValueError("Gemini returned JSON that did not contain exactly one candidate object.")
             return data
         except Exception as exc:
             last_error = exc
@@ -262,138 +273,79 @@ def generate_json(client, prompt: str) -> dict:
     raise last_error
 
 
-def attach_source_files(rows: list[dict], candidates: list[dict]) -> list[dict]:
-    unused = list(candidates)
-    attached = []
-    for row in rows:
-        source = str(row.get("source_file") or "").strip().lower()
-        match = None
-        if source:
-            match = next(
-                (item for item in unused if item["filename"].lower() == source),
-                None,
-            )
-        if match is None and unused:
-            match = unused[0]
-        if match is not None:
-            unused.remove(match)
-            row["source_file"] = match["filename"]
-        attached.append(row)
-    for leftover in unused:
-        attached.append(
-            {
-                "name": os.path.splitext(leftover["filename"])[0],
-                "source_file": leftover["filename"],
-                "match_score": 0,
-                "key_strengths": ["Ranking did not return details for this CV."],
-                "weaknesses": ["Re-run ranking if this candidate should be scored."],
-            }
-        )
-    return attached
-
-
-def score_batch(client, job_description: str, candidates: list[dict]) -> list[dict]:
-    data = generate_json(client, build_batch_prompt(job_description, candidates))
-    rows = data.get("leaderboard")
-    if not isinstance(rows, list) or not rows:
-        raise ValueError("Gemini returned an empty leaderboard for a batch.")
-    return attach_source_files(rows, candidates)
-
-
-def score_batch_resilient(client, job_description: str, candidates: list[dict]) -> list[dict]:
-    try:
-        return score_batch(client, job_description, candidates)
-    except Exception as exc:
-        if len(candidates) == 1 or not is_retryable(exc):
-            raise
-        mid = max(1, len(candidates) // 2)
-        return score_batch_resilient(client, job_description, candidates[:mid]) + (
-            score_batch_resilient(client, job_description, candidates[mid:])
-        )
-
-
-def fallback_justification(best: dict) -> str:
-    strengths = as_items(best.get("key_strengths"))
-    if len(strengths) >= 2:
-        return f"{strengths[0]} {strengths[1]}"
-    if strengths:
-        return f"{best.get('name', 'This candidate')} is the strongest match. {strengths[0]}"
-    return (
-        f"{best.get('name', 'This candidate')} has the highest match score against the job description. "
-        "Review the strengths and weaknesses below before making a final hire."
-    )
-
-
 def rank_candidates(
     api_key: str,
     job_description: str,
     candidates: list[dict],
     progress=None,
     status=None,
-) -> dict:
-    batches = list(batched(candidates, BATCH_SIZE))
-    total = max(len(batches), 1)
+) -> list[dict]:
+    total = len(candidates)
     leaderboard = []
-    failed = []
     finished = 0
-    workers = min(MAX_WORKERS, total)
+    workers = min(MAX_WORKERS, max(total, 1))
 
     if status is not None:
-        status.info(f"Ranking {len(candidates)} CVs in {total} parallel batches...")
+        status.info(f"Ranking {total} CVs...")
     if progress is not None:
-        progress.progress(0, text="Starting parallel ranking...")
+        progress.progress(0, text="Starting ranking...")
 
-    def run_batch(batch: list[dict]) -> list[dict]:
+    def run_candidate(candidate: dict) -> dict:
         client = genai.Client(api_key=api_key)
-        return score_batch_resilient(client, job_description, batch)
+        parsed = generate_json(client, build_candidate_prompt(job_description, candidate))[0]
+        score = max(0, min(100, int(parsed.get("Match_Score", 0))))
+        return {
+            "Name": str(parsed.get("Name") or os.path.splitext(candidate["filename"])[0]),
+            "Match_Score": score,
+            "Key_Strengths": as_items(parsed.get("Key_Strengths")),
+            "Missing_Requirements": as_items(parsed.get("Missing_Requirements")),
+            "Top_Recommendation_Status": str(
+                parsed.get("Top_Recommendation_Status") or "Not Recommended"
+            ),
+        }
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(run_batch, batch): batch for batch in batches}
+        futures = {pool.submit(run_candidate, candidate): candidate for candidate in candidates}
         for future in as_completed(futures):
-            batch = futures[future]
+            candidate = futures[future]
             finished += 1
             try:
-                leaderboard.extend(future.result())
+                leaderboard.append(future.result())
             except Exception as exc:
-                failed.extend(item["filename"] for item in batch)
-                for item in batch:
-                    leaderboard.append(
-                        {
-                            "name": os.path.splitext(item["filename"])[0],
-                            "source_file": item["filename"],
-                            "match_score": 0,
-                            "key_strengths": ["Could not score this CV because Gemini was overloaded."],
-                            "weaknesses": [f"Retry this file later. Last error: {exc}"],
-                        }
-                    )
+                candidate_name = os.path.splitext(candidate["filename"])[0]
+                st.warning(f"{candidate_name}: Failed to Analyze ({exc})")
+                leaderboard.append(
+                    {
+                        "Name": candidate_name,
+                        "Match_Score": 0,
+                        "Key_Strengths": [],
+                        "Missing_Requirements": ["Failed to Analyze"],
+                        "Top_Recommendation_Status": "Failed to Analyze",
+                    }
+                )
             if progress is not None:
                 progress.progress(
                     finished / total,
-                    text=f"Scored {finished} of {total} batches",
+                    text=f"Processed {finished} of {total} CVs",
                 )
             if status is not None:
-                status.info(f"Scored {finished} of {total} batches")
+                status.info(f"Processed {finished} of {total} CVs")
 
-    leaderboard.sort(key=lambda row: int(row.get("match_score", 0) or 0), reverse=True)
+    leaderboard.sort(key=lambda row: row["Match_Score"], reverse=True)
     if not leaderboard:
         raise ValueError("No candidates could be ranked.")
 
-    best = next((row for row in leaderboard if int(row.get("match_score", 0) or 0) > 0), leaderboard[0])
-    recommendation = {
-        "name": str(best.get("name") or "Unknown candidate"),
-        "justification": fallback_justification(best),
-    }
+    best = next((row for row in leaderboard if row["Match_Score"] > 0), None)
+    if best is not None:
+        best["Top_Recommendation_Status"] = "Top Recommendation"
+        for row in leaderboard:
+            if row is not best and row["Top_Recommendation_Status"] != "Failed to Analyze":
+                row["Top_Recommendation_Status"] = "Not Recommended"
     if status is not None:
-        if failed:
-            status.warning(
-                "Ranked most CVs, but Gemini skipped some during high demand: "
-                + ", ".join(failed)
-            )
-        else:
-            status.empty()
+        status.empty()
     if progress is not None:
         progress.empty()
-    return {"top_recommendation": recommendation, "leaderboard": leaderboard}
+    return leaderboard
 
 
 def get_api_key() -> str:
@@ -470,6 +422,9 @@ if rank_clicked:
         for message in errors:
             st.error(message)
     else:
+        st.session_state.pop("ranking_results", None)
+        st.session_state.pop("ranking_dataframe", None)
+        st.session_state.pop("top_recommendation", None)
         candidates = []
         parse_errors = []
         text_limit = cv_char_limit(len(uploaded_files))
@@ -482,13 +437,19 @@ if rank_clicked:
                     }
                 )
             except Exception as exc:
-                parse_errors.append(f"{uploaded.name}: {exc}")
-
-        if parse_errors:
-            for message in parse_errors:
-                st.warning(message)
+                candidate_name = os.path.splitext(uploaded.name)[0]
+                parse_errors.append(
+                    {
+                        "Name": candidate_name,
+                        "Match_Score": 0,
+                        "Key_Strengths": [],
+                        "Missing_Requirements": [f"Failed to Analyze: {exc}"],
+                        "Top_Recommendation_Status": "Failed to Analyze",
+                    }
+                )
 
         if not candidates:
+            results = parse_errors
             st.error("No readable CVs were found.")
         else:
             progress = st.progress(0, text="Starting ranking...")
@@ -501,65 +462,55 @@ if rank_clicked:
                     progress=progress,
                     status=status,
                 )
-                st.session_state["ranking_result"] = result
+                results = result + parse_errors
             except Exception as exc:
                 progress.empty()
                 status.empty()
-                st.session_state.pop("ranking_result", None)
+                results = parse_errors
                 st.error(
                     "Ranking failed after retries. Gemini was overloaded or unreachable. "
                     f"Wait a minute and try again. Details: {exc}"
                 )
 
-result = st.session_state.get("ranking_result")
-if result:
-    recommendation = result.get("top_recommendation", {})
-    name = html.escape(str(recommendation.get("name", "Unknown candidate")))
-    justification = html.escape(str(recommendation.get("justification", "")))
+        results.sort(key=lambda row: row["Match_Score"], reverse=True)
+        top_candidate = next(
+            (row for row in results if row["Top_Recommendation_Status"] == "Top Recommendation"),
+            None,
+        )
+        if top_candidate:
+            strengths = as_items(top_candidate.get("Key_Strengths"))
+            rationale = " ".join(strengths[:2])
+            recommendation_text = f"{top_candidate['Name']} ({top_candidate['Match_Score']}%). {rationale}"
+        else:
+            recommendation_text = "No candidate could be recommended because no CV was successfully analyzed."
 
+        st.session_state["ranking_results"] = results
+        st.session_state["ranking_dataframe"] = pd.DataFrame(
+            results,
+            columns=[
+                "Name",
+                "Match_Score",
+                "Key_Strengths",
+                "Missing_Requirements",
+                "Top_Recommendation_Status",
+            ],
+        )
+        st.session_state["top_recommendation"] = recommendation_text
+
+if "ranking_results" in st.session_state:
     st.markdown('<div class="section-label">Top recommendation</div>', unsafe_allow_html=True)
     st.markdown(
-        f"""
-        <div class="hire-card">
-          <p class="hire-kicker">Hire this candidate</p>
-          <p class="hire-name">{name}</p>
-          <p class="hire-why">{justification}</p>
-        </div>
-        """,
+        f'<div class="hire-card"><p class="hire-kicker">Top candidate</p>'
+        f'<p class="hire-why">{html.escape(st.session_state["top_recommendation"])}</p></div>',
         unsafe_allow_html=True,
     )
 
     st.markdown('<div class="section-label">Leaderboard</div>', unsafe_allow_html=True)
-    for index, row in enumerate(result.get("leaderboard", []), start=1):
-        score = max(0, min(100, int(row.get("match_score", 0))))
-        strengths = as_items(row.get("key_strengths") or row.get("Key Strengths"))
-        weaknesses = as_items(
-            row.get("weaknesses")
-            or row.get("missing_requirements")
-            or row.get("Missing Requirements")
-        )
-        person = html.escape(str(row.get("name", "Unknown")))
-        st.markdown(
-            f"""
-            <div class="candidate-card">
-              <div class="card-head">
-                <div>
-                  <span class="rank-pill">{index}</span>
-                  <span class="cand-name">{person}</span>
-                </div>
-                <div class="score {score_class(score)}">{score}%</div>
-              </div>
-              <div class="box-grid">
-                <div class="info-box strengths">
-                  <h4>Strengths</h4>
-                  {items_html(strengths, "No strengths noted.")}
-                </div>
-                <div class="info-box weaknesses">
-                  <h4>Weaknesses</h4>
-                  {items_html(weaknesses, "No weaknesses noted.")}
-                </div>
-              </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+    ranking_dataframe = st.session_state["ranking_dataframe"]
+    st.dataframe(ranking_dataframe, use_container_width=True, hide_index=True)
+    st.download_button(
+        "Download leaderboard as CSV",
+        data=ranking_dataframe.to_csv(index=False).encode("utf-8"),
+        file_name="candidate_leaderboard.csv",
+        mime="text/csv",
+    )
