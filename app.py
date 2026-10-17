@@ -4,8 +4,8 @@ import os
 import re
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
 import streamlit as st
@@ -13,10 +13,15 @@ from google import genai
 from google.genai import types
 from pypdf import PdfReader
 
-MODEL_NAME = "gemini-1.5-flash"
+MODEL_NAME = os.environ.get("GEMINI_MODEL_NAME", "gemini-3.8-flash")
+MODEL_FALLBACKS = (
+    MODEL_NAME,
+    "gemini-3.8-flash",
+    "gemini-1.5-flash",
+)
 MAX_CV_CHARS = 12_000
 BATCH_SIZE = 8
-MAX_WORKERS = 5
+MAX_WORKERS = 8
 MAX_RETRIES = 3
 MIN_API_REQUEST_INTERVAL = 3.0
 RETRYABLE_MARKERS = (
@@ -290,43 +295,40 @@ def generate_json(
 ) -> list:
     last_error = None
     delay = 0.8
+    model_names = tuple(dict.fromkeys(MODEL_FALLBACKS))
     for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            before_request()
-            response = client.models.generate_content(
-                model=MODEL_NAME,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    temperature=0.1,
-                    max_output_tokens=4096,
-                    response_mime_type="application/json",
-                ),
-            )
-            data = json.loads(response.text)
-            if (
-                not isinstance(data, list)
-                or len(data) != expected_count
-                or any(not isinstance(row, dict) for row in data)
-            ):
-                raise ValueError(
-                    f"Gemini returned JSON that did not contain exactly {expected_count} candidate objects."
+        for model_name in model_names:
+            try:
+                before_request()
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        temperature=0.1,
+                        max_output_tokens=4096,
+                        response_mime_type="application/json",
+                    ),
                 )
-            return data
-        except Exception as exc:
-            last_error = exc
-            if not is_retryable(exc) or attempt == MAX_RETRIES:
-                raise
-            time.sleep(max(delay, retry_after_seconds(exc)))
-            delay = min(delay * 2, 4)
+                data = json.loads(response.text)
+                if (
+                    not isinstance(data, list)
+                    or len(data) != expected_count
+                    or any(not isinstance(row, dict) for row in data)
+                ):
+                    raise ValueError(
+                        f"Gemini returned JSON that did not contain exactly {expected_count} candidate objects."
+                    )
+                return data
+            except Exception as exc:
+                last_error = exc
+                error_text = str(exc).upper()
+                if "NOT_FOUND" in error_text or "is not found" in error_text:
+                    continue
+                if not is_retryable(exc) or attempt == MAX_RETRIES:
+                    raise
+        time.sleep(max(delay, retry_after_seconds(last_error or Exception("retry"))))
+        delay = min(delay * 2, 4)
     raise last_error
-
-
-@st.cache_data(show_spinner=False)
-def analyze_candidate_cv(job_description: str, filename: str, cv_text: str) -> dict:
-    client = genai.Client(api_key=get_api_key())
-    prompt = build_candidate_prompt(job_description, [{"filename": filename, "text": cv_text}])
-    parsed_rows = generate_json(client, prompt, expected_count=1)
-    return parsed_rows[0]
 
 
 def rank_candidates(
@@ -337,62 +339,73 @@ def rank_candidates(
     status=None,
 ) -> list[dict]:
     total = len(candidates)
+    batch_size = min(BATCH_SIZE, max(1, total))
+    batches = list(batched(candidates, batch_size))
     leaderboard = []
     finished = 0
-    progress_lock = threading.Lock()
-    workers = min(MAX_WORKERS, max(1, total))
+    workers = min(MAX_WORKERS, len(batches))
 
     if status is not None:
         status.info(f"Ranking {total} CVs...")
     if progress is not None:
-        progress.progress(0.0, text="Starting ranking...")
+        progress.progress(0, text="Starting ranking...")
 
-    def analyze_one_candidate(candidate: dict) -> dict:
-        parsed = analyze_candidate_cv(job_description, candidate["filename"], candidate["text"])
-        score = max(0, min(100, int(parsed.get("Match_Score", 0))))
-        return {
-            "Name": str(parsed.get("Name") or os.path.splitext(candidate["filename"])[0]),
-            "Match_Score": score,
-            "Key_Strengths": as_items(parsed.get("Key_Strengths")),
-            "Missing_Requirements": as_items(parsed.get("Missing_Requirements")),
-            "Top_Recommendation_Status": str(
-                parsed.get("Top_Recommendation_Status") or "Not Recommended"
-            ),
-        }
+    shared_client = genai.Client(api_key=api_key)
 
-    def record_result(row: dict) -> int:
+    def run_batch(batch: list[dict]) -> list[dict]:
+        parsed_rows = generate_json(
+            shared_client,
+            build_candidate_prompt(job_description, batch),
+            expected_count=len(batch),
+        )
+        results = []
+        for candidate, parsed in zip(batch, parsed_rows):
+            score = max(0, min(100, int(parsed.get("Match_Score", 0))))
+            results.append(
+                {
+                    "Name": str(parsed.get("Name") or os.path.splitext(candidate["filename"])[0]),
+                    "Match_Score": score,
+                    "Key_Strengths": as_items(parsed.get("Key_Strengths")),
+                    "Missing_Requirements": as_items(parsed.get("Missing_Requirements")),
+                    "Top_Recommendation_Status": str(
+                        parsed.get("Top_Recommendation_Status") or "Not Recommended"
+                    ),
+                }
+            )
+        return results
+
+    def record_result(row: dict) -> None:
         nonlocal finished
-        with progress_lock:
-            leaderboard.append(row)
-            finished += 1
-            current = finished
+        leaderboard.append(row)
+        finished += 1
         if progress is not None:
-            progress.progress(min(current / total, 1.0), text=f"Processed {current} of {total} CVs")
+            progress.progress(
+                finished / total,
+                text=f"Processed {finished} of {total} CVs",
+            )
         if status is not None:
-            status.info(f"Processed {current} of {total} CVs")
-        return current
+            status.info(f"Processed {finished} of {total} CVs")
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {
-            pool.submit(analyze_one_candidate, candidate): candidate for candidate in candidates
-        }
+        futures = {pool.submit(run_batch, batch): batch for batch in batches}
         for future in as_completed(futures):
-            candidate = futures[future]
+            batch = futures[future]
             try:
-                row = future.result()
-                record_result(row)
+                for row in future.result():
+                    record_result(row)
             except Exception as exc:
-                candidate_name = os.path.splitext(candidate["filename"])[0]
-                st.warning(f"{candidate_name}: Failed to Analyze ({exc})")
-                record_result(
-                    {
-                        "Name": candidate_name,
-                        "Match_Score": 0,
-                        "Key_Strengths": [],
-                        "Missing_Requirements": ["Failed to Analyze"],
-                        "Top_Recommendation_Status": "Failed to Analyze",
-                    }
-                )
+                for candidate in batch:
+                    candidate_name = os.path.splitext(candidate["filename"])[0]
+                    st.warning(f"{candidate_name}: Failed to Analyze ({exc})")
+                    record_result(
+                        {
+                            "Name": candidate_name,
+                            "Match_Score": 0,
+                            "Key_Strengths": [],
+                            "Missing_Requirements": ["Failed to Analyze"],
+                            "Top_Recommendation_Status": "Failed to Analyze",
+                        }
+                    )
 
     leaderboard.sort(key=lambda row: row["Match_Score"], reverse=True)
     if not leaderboard:
